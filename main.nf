@@ -27,14 +27,14 @@ if (params.reference) {
     ch_reference = Channel.fromPath("${params.reference}", checkIfExists: true).map{
         it -> tuple(id: it.baseName, it, "${it}.fai")
     }
-} else { exit 1, "Reference FASTA not specified!" }
+} else if (!params.phased_bam) { exit 1, "Reference FASTA not specified!" }
 if (params.cgi_bedfile) {
     ch_cgibed = Channel.fromPath(params.cgi_bedfile, checkIfExists: true)
         .map{
             it -> tuple(id: it.baseName, it)
         }
 } else { exit 1, "CGI Bed file not specified!"}
-if (!(params.deepvariant_model in ["WGS", "WES", "PACBIO", "ONT_R104", "HYBRID_PACBIO_ILLUMINA"])) {
+if (!params.phased_bam && !(params.deepvariant_model in ["WGS", "WES", "PACBIO", "ONT_R104", "HYBRID_PACBIO_ILLUMINA"])) {
     exit 1, "DeepVariant model must be one of WGS, WES, PACBIO, ONT_R104, or HYBRID_PACBIO_ILLUMINA"
 }
 /*
@@ -59,6 +59,7 @@ WorkflowMain.initialise(workflow, params, log)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 */
 include {INPUT_CHECK} from './subworkflows/local/input_check.nf'
+include {INPUT_CHECK_PHASED} from './subworkflows/local/input_check.nf'
 include {MINIMAP2} from "./modules/local/minimap2/main.nf"
 include {SAMTOOLS_MERGE} from "./modules/local/samtools/merge/main.nf"
 // two processes needed as two sets of bams are indexed.
@@ -73,6 +74,57 @@ include {WHATSHAP_HAPLOTAG} from "./modules/local/whatshap/haplotag/main.nf"
 include {WHATSHAP_HAPLOTAG as WHATSHAP_HAPLOTAG_MERGED} from "./modules/local/whatshap/haplotag/main.nf"
 include {MOSDEPTH} from "./modules/local/mosdepth/main.nf"
 include {MOSDEPTH as MOSDEPTH_MERGED} from "./modules/local/mosdepth/main.nf"
+
+process WHATSHAP_STATS_FROM_BAM {
+    tag "${meta.id}"
+    label "process_single"
+    publishDir "${params.outdir}/whatshap", mode: "copy"
+
+    conda "bioconda::samtools=1.19.2"
+    container "quay.io/biocontainers/samtools:1.19.2--h50ea8bc_1"
+
+    input:
+    tuple val(meta), path(bam), path(bai)
+
+    output:
+    tuple val(meta), path("${meta.id}_whatshapstats.txt"), path("${meta.id}_blocks.tsv")
+
+    script:
+    """
+    echo -e 'sample\tchromosome\tphase_set\tfrom\tto\tvariant_count' > "${meta.id}_blocks.tsv"
+
+    samtools view -d HP "${bam}" ${params.deepvariant_region} \\
+        | awk -F '\t' '
+            BEGIN { OFS="\t" }
+            {
+                chr = \$3; pos = \$4
+                ps = ""; hp = ""
+                for (i = 12; i <= NF; i++) {
+                    if (\$i ~ /^PS:i:/) ps = substr(\$i, 6)
+                    if (\$i ~ /^HP:i:/) hp = substr(\$i, 6)
+                }
+                if (ps != "" && hp != "") {
+                    key = chr SUBSEP ps
+                    chrom[key] = chr
+                    phase[key] = ps
+                    if (!(key in minpos) || pos < minpos[key]) minpos[key] = pos
+                    if (!(key in maxpos) || pos > maxpos[key]) maxpos[key] = pos
+                    count[key]++
+                }
+            }
+            END {
+                for (key in count)
+                    print "${meta.id}", chrom[key], phase[key], minpos[key], maxpos[key], count[key]
+            }' \\
+        | sort -k2,2 -k4,4n >> "${meta.id}_blocks.tsv"
+
+    n_blocks=\$(tail -n +2 "${meta.id}_blocks.tsv" | wc -l)
+    n_reads=\$(samtools view -c -d HP "${bam}" ${params.deepvariant_region})
+    echo "# Phase block summary derived from haplotagged BAM (${params.deepvariant_region} only)" > "${meta.id}_whatshapstats.txt"
+    echo "Number of phase blocks: \${n_blocks}" >> "${meta.id}_whatshapstats.txt"
+    echo "Number of haplotagged reads: \${n_reads}" >> "${meta.id}_whatshapstats.txt"
+    """
+}
 include {SAMTOOLS_VIEWHP} from "./modules/local/samtools/view_hp/main.nf"
 include {R_CLUSTERBYMETH} from "./modules/local/R/cluster_by_meth/main.nf"
 include {reporting} from "./subworkflows/reporting.nf"
@@ -82,6 +134,72 @@ include {separated_deepvariant} from "./subworkflows/local/deepvariant/main.nf"
 // WORKFLOW: Run main SkewX analysis pipeline
 //
 workflow SKEWX {
+
+    if (params.phased_bam) {
+        // --- Phased BAM mode: start from stage 8 (coverage analysis) ---
+        // Each row in the samplesheet is one sample; meta.sample is a plain string,
+        // matching exactly the shape of ch_samples_haplotag in the default workflow.
+
+        // Index only if .bai is not already present next to the BAM
+        ch_phased_input = INPUT_CHECK_PHASED(ch_input)
+        ch_samples_haplotag = ch_phased_input
+            .branch{
+                needs_index: !file("${it[1]}.bai").exists()
+                has_index:   file("${it[1]}.bai").exists()
+            }
+        ch_samples_haplotag_indexed = SAMTOOLS_INDEX_HAPLOTAG(ch_samples_haplotag.needs_index)
+        ch_samples_haplotag_ready = ch_samples_haplotag_indexed
+            .mix(ch_samples_haplotag.has_index.map{meta, bam -> tuple(meta, bam, file("${bam}.bai"))})
+
+        // mosdepth on each individual sample (mirrors MOSDEPTH(ch_samples_haplotag))
+        (ch_mosdepth, ch_mosdepth_report_results) = MOSDEPTH(ch_samples_haplotag_ready)
+
+        // extract HP reads over CGI bed per sample (mirrors default workflow)
+        (ch_tmp_samples_haplotag, ch_cgibed_rep) = ch_samples_haplotag_ready
+            .combine(ch_cgibed.collect())
+            .multiMap{it ->
+                samples_haplotag: tuple(it[0], it[1], it[2])
+                cgibed: tuple(it[3], it[4])
+            }
+        ch_hpreads = SAMTOOLS_VIEWHP(ch_tmp_samples_haplotag, ch_cgibed_rep)
+        ch_clustered_reads = R_CLUSTERBYMETH(ch_hpreads, ch_cgibed_rep)
+
+        // build ch_mosdepth_all_report_results grouped by individual
+        // (mirrors the mix+groupTuple in the default workflow)
+        ch_mosdepth_report_results
+            .map{it -> tuple(it[0].id, it[0].sample, it[1])}
+            .groupTuple()
+            .map{it -> tuple([id: it[0], sample: it[1].sort()], it[2])}
+            .set{ch_mosdepth_all_report_results}
+
+        // build ch_all_samples_haplotag grouped by individual
+        // (mirrors the mix+groupTuple in the default workflow)
+        ch_samples_haplotag_ready
+            .map{it -> tuple(it[0].id, it[0].sample, it[1], it[2])}
+            .groupTuple()
+            .map{it -> tuple([id: it[0], sample: it[1].sort()], it[2], it[3])}
+            .set{ch_all_samples_haplotag}
+
+        // derive phase blocks from HP/PS tags in the BAM (chrX only for speed)
+        // called once per individual on the grouped channel to match reporting join key
+        ch_whatshap_stats_blocks = ch_samples_haplotag_ready
+            .map{meta, bam, bai -> tuple(meta.id, meta.sample, bam, bai)}
+            .groupTuple()
+            .map{id, samples, bams, bais -> tuple([id: id, sample: samples.sort()], bams[0], bais[0])}
+            | WHATSHAP_STATS_FROM_BAM
+
+        reporting(
+            ch_mosdepth_all_report_results,
+            ch_all_samples_haplotag,
+            ch_whatshap_stats_blocks,
+            ch_clustered_reads,
+            ch_cgibed
+        )
+
+        return
+    }
+
+    // --- Full pipeline mode ---
     // parse input sample sheet
     ch_checked_input = INPUT_CHECK(ch_input)
 

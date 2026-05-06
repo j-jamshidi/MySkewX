@@ -19,3 +19,17 @@ workflow INPUT_CHECK {
     ch_sample                                     // channel: [ val(individual), val(sample) path(modbam) ]
 }
 
+workflow INPUT_CHECK_PHASED {
+    take:
+    samplesheet // file: /path/to/samplesheet.csv with columns: individual,sample,haplotagged_bam
+
+    main:
+    samplesheet
+        .splitCsv( header:true, sep:',' )
+        .map{row -> tuple([id: row.individual, sample: row.sample], file(row.haplotagged_bam))}
+        .set{ch_sample}
+
+    emit:
+    ch_sample                                     // channel: [ val(meta), path(haplotagged_bam) ]
+}
+

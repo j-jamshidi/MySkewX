@@ -26,11 +26,16 @@
                 },
                 "reference": {
                     "type": "string",
-                    "description": "Path to the reference genome"
+                    "description": "Path to the reference genome (required when --phased_bam false)"
+                },
+                "phased_bam": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Start from haplotagged BAM input. Set to false to run the full pipeline from unphased modbam."
                 }
             },
             "required": [
-                "cgi_bedfile","reference"
+                "cgi_bedfile"
             ]
         },
         "long_read_technology": {

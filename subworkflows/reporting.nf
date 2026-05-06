@@ -27,12 +27,25 @@ workflow reporting {
         ch_nanocomp = NANOCOMP(haplotagged_samples)
 
         // combine nanocomp + mosdepth reports
+        // join key is (id, sample) — sample is a sorted list after groupTuple in main.nf
+        // flat tuple after all joins:
+        // [0:id, 1:sample, 2:nanocomp_htmls, 3:mosdepth_html, 4:whatshap_stats_txt, 5:whatshap_blocks_tsv, 6:[clustered_reads_list], 7:[skew_list]]
         ch_combined_qc_reports = ch_nanocomp
             .map{it -> tuple(it[0].id, it[0].sample, it[1])}
             .join(ch_mosdepth_dist_report.map{it -> tuple(it[0].id, it[0].sample, it[1])})
-            .join(whatshap_stats_blocks.map{it -> tuple(it[0].id, it[0].sample, it[1], it[2])}) // blocks in 3rd element
-            .join(clustered_reads.map{it -> tuple(it[0].id, it[0].sample, it[1], it[2])}.groupTuple())
-            .map{it -> tuple([id: it[0], sample: it[1]], it[2] + [it[4]], it[6], it[7], it[9], it[10])}
+            .join(whatshap_stats_blocks.map{it -> tuple(it[0].id, it[0].sample, it[1], it[2])})
+            .join(
+                clustered_reads
+                    .map{it -> tuple(it[0].id, it[1], it[2])}  // key on id only; sample is a plain string here
+                    .groupTuple()                               // group all clustered/skew files per individual
+                    .map{id, clustered_list, skew_list ->
+                        // recover the grouped sample list from nanocomp channel via join on id
+                        tuple(id, clustered_list, skew_list)
+                    }
+                    .join(ch_nanocomp.map{it -> tuple(it[0].id, it[0].sample)})  // bring in the sorted sample list
+                    .map{id, clustered_list, skew_list, sample_list -> tuple(id, sample_list, clustered_list, skew_list)}
+            )
+            .map{it -> tuple([id: it[0], sample: it[1]], it[2] + [it[3]], it[4], it[5], it[6], it[7])}
             .combine(cgi_bed.map{it -> it[1]})
             .combine(channel.fromPath("${projectDir}/assets/report-templates/individual_report.qmd", checkIfExists: true))
 
