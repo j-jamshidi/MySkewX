@@ -111,21 +111,6 @@ sample1,NSC,/path/to/sample1_NSC.bam
 | `--deepvariant_num_shards` | `24` | Number of CPUs for DeepVariant make_examples step |
 | `--lrs` | `ont` | Long-read sequencing platform (`ont` or `pacbio`) |
 
-## Example data
-
-An example dataset is available in the `test_data` directory. It contains a small region of the mouse X chromosome with methylation information.
-
-To run with the full pipeline (from unphased modbam):
-```bash
-nextflow main.nf \
-  --input test_data/test_data_samplesheet.csv \
-  --outdir skew_test_results \
-  --reference test_data/Mus_musculus.GRCm38.dna.chromosome.X.fa.gz \
-  --cgi_bedfile additional_files/CGIs_mm38_chrX.bed \
-  --phased_bam false \
-  -profile singularity
-```
-
 ## Credits
 
 SkewX was originally written by Quentin Gouil, James Lancaster and Ed Yang.
