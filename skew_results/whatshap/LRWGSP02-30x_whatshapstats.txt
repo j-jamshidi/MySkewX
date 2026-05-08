@@ -1,3 +1,0 @@
-# Phase block summary derived from haplotagged BAM (chrX only)
-Number of phase blocks: 943
-Number of haplotagged reads: 162068
