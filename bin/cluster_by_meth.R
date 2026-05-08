@@ -5,28 +5,68 @@ library(tidyverse)
 library(doParallel)
 library(foreach)
 
+# Patched version of NanoMethViz:::cluster_reads that adds values_fn = mean to
+# pivot_wider, preventing list-col errors when the BAM contains both 5mC and
+# 5hmC modification calls for the same (read_name, pos).
+cluster_reads_fixed <- function(x, chr, start, end, min_pts = 5) {
+  assertthat::assert_that(
+    methods::is(x, "ModBamResult"),
+    assertthat::is.string(chr) || (is.factor(chr) && assertthat::is.scalar(chr)),
+    assertthat::is.number(start) && assertthat::is.number(end),
+    assertthat::is.number(min_pts) && min_pts >= 1
+  )
+  methy_data <- NanoMethViz::query_methy(x, chr, start, end)
+  if (nrow(methy_data) == 0) {
+    stop(glue::glue("no reads containing methylation data found in specified region"))
+  }
+  methy_data <- methy_data %>% dplyr::filter(.data$pos >= start & .data$pos < end)
+  read_stats <- NanoMethViz:::get_read_stats(methy_data)
+  max_span <- max(read_stats$span)
+  keep_reads <- read_stats$read_name[read_stats$span > 0.9 * max_span]
+  methy_data <- methy_data %>% dplyr::filter(.data$read_name %in% keep_reads)
+  mod_mat <- methy_data %>%
+    dplyr::select("read_name", "pos", "mod_prob") %>%
+    dplyr::arrange(.data$pos) %>%
+    tidyr::pivot_wider(names_from = "pos", values_from = "mod_prob", values_fn = mean) %>%
+    NanoMethViz:::df_to_matrix()
+  if (nrow(mod_mat) < min_pts) {
+    stop(glue::glue("fewer reads available ({nrow(mod_mat)} reads) than minimum cluster size 'min_pts' ({min_pts})"))
+  }
+  mod_mat_filled <- mod_mat[order(rownames(mod_mat)), ]
+  col_missingness <- NanoMethViz:::mat_col_map(mod_mat_filled, NanoMethViz:::missingness)
+  mod_mat_filled <- mod_mat_filled[, col_missingness < 0.6]
+  row_missingness <- NanoMethViz:::mat_row_map(mod_mat_filled, NanoMethViz:::missingness)
+  mod_mat_filled <- mod_mat_filled[row_missingness < 0.3, ]
+  for (i in seq_len(nrow(mod_mat_filled))) {
+    mod_mat_filled[i, is.na(mod_mat_filled[i, ])] <- mean(mod_mat_filled[i, ], na.rm = TRUE)
+  }
+  if (nrow(mod_mat_filled) < min_pts) {
+    stop(glue::glue("fewer reads available ({nrow(mod_mat_filled)} reads) than minimum cluster size 'min_pts' ({min_pts})"))
+  }
+  dbsc <- dbscan::hdbscan(mod_mat_filled, minPts = min_pts)
+  clust_df <- data.frame(read_name = rownames(mod_mat_filled), cluster_id = dbsc$cluster)
+  clust_df %>%
+    dplyr::inner_join(read_stats, by = "read_name") %>%
+    dplyr::arrange(.data$cluster_id) %>%
+    dplyr::mutate(
+      cluster_id = as.factor(.data$cluster_id),
+      start = as.integer(.data$start),
+      end = as.integer(.data$end),
+      span = as.integer(.data$span)
+    )
+}
+
 apply_cluster_reads_parallel <- function(mbr, bed, min_pts, num_cores = 4) {
-  # Initialize a parallel backend
-  #cl <- makeCluster(detectCores())
-  #try with 4 cores first
   cl <- makeCluster(num_cores)
   registerDoParallel(cl)
 
-  # Create a progress bar
-  pb <- progress_estimated(nrow(bed))
-
-  # Define a function to process each row
   process_row <- function(row) {
-    # Get the current row
     current_row <- bed[row, ]
 
-    # Apply the cluster_reads function to the current row
     row_cluster <- tryCatch({
-      NanoMethViz:::cluster_reads(mbr, current_row$chr, current_row$start, current_row$end, min_pts = min_pts)},
+      cluster_reads_fixed(mbr, current_row$chr, current_row$start, current_row$end, min_pts = min_pts)},
       error = function(err){
-        # Handle the error (e.g., print a message)
         message(paste("Error in row", row, ":", err$message))
-        # Skip to the next row
         return(NA)
       })
 
@@ -34,14 +74,11 @@ apply_cluster_reads_parallel <- function(mbr, bed, min_pts, num_cores = 4) {
       return(NULL)
     }
 
-    # Add the CGI_id and chr, start, end
     row_cluster <- row_cluster %>% mutate(CGI_id = paste0(current_row$chr, ":", current_row$start, "-", current_row$end), chr = current_row$chr, start = current_row$start, end = current_row$end)
 
-    # Calculate the average methylation by cluster_id and add it as a new column
     row_cluster <- row_cluster %>% group_by(cluster_id) %>% mutate(avg_cluster_methylation = mean(mean))
 
-    # If there are exactly 2 clusters, assign the cluster with the lowest average methylation to Xa and the other to Xi
-    if (nlevels(row_cluster$cluster_id) == 2) { # Watch out for NA clusters...
+    if (nlevels(row_cluster$cluster_id) == 2) {
       low_mC <- row_cluster %>% filter(cluster_id %in% c("1", "2")) %>% pull(avg_cluster_methylation) %>% min()
       high_mC <- row_cluster %>% filter(cluster_id %in% c("1", "2")) %>% pull(avg_cluster_methylation) %>% max()
       row_cluster <- row_cluster %>% mutate(assigned_X = case_when(avg_cluster_methylation == low_mC ~ "Xa", avg_cluster_methylation == high_mC ~ "Xi", TRUE ~ "NA"))
@@ -52,56 +89,57 @@ apply_cluster_reads_parallel <- function(mbr, bed, min_pts, num_cores = 4) {
     return(row_cluster)
   }
 
-  # Apply the function to each row in parallel
-  res <- foreach(row = 1:nrow(bed), .combine = bind_rows, .packages = c("tidyverse", "NanoMethViz")) %dopar% {
-    pb$tick()  # Update the progress bar
+  res <- foreach(row = 1:nrow(bed), .combine = bind_rows,
+                 .packages = c("tidyverse", "NanoMethViz"),
+                 .export = c("cluster_reads_fixed")) %dopar% {
     process_row(row)
   }
 
-  # Stop the parallel backend
   stopCluster(cl)
 
-  # Combine the results
   res <- bind_rows(res)
 
   return(res)
 }
 
 calculate_skew_by_block <- function(clustered_reads, haplotyped_reads){
-  #remove uninformative reads that don’t clusters or reads from CGIs that don’t have exactly 2 clusters
+  if (is.null(clustered_reads) || nrow(clustered_reads) == 0 || !("assigned_X" %in% colnames(clustered_reads))) {
+    stop("No reads were successfully clustered. Check that the BAM index is up to date (run: samtools index <bam>).")
+  }
   clustered_reads <- clustered_reads %>% filter(assigned_X %in% c("Xa","Xi"))
-  #remove reads that appear multiple times because they span several CGIs
   clustered_reads <- clustered_reads %>% distinct(read_name, .keep_all = TRUE)
-  #merge methylation cluster information with haplotype and phase set information
   df2 <- left_join(clustered_reads,haplotyped_reads)
-  #remove the reads that couldn’t be haplotyped
   df2 <- df2 %>% filter(!is.na(HP))
 
-  #count by haplotype blocks
-  counts_by_block <- df2 %>% group_by(PS, assigned_X, HP) %>% summarise(counts = n())
+  counts_by_block <- df2 %>% group_by(PS, assigned_X, HP) %>% summarise(counts = n(), .groups = "drop")
 
   skew_by_block <- counts_by_block %>%
     unite(combi, assigned_X, HP) %>%
     mutate(combi = recode(combi, "Xa_1" = "H1_Xa", "Xa_2" = "H2_Xa", "Xi_1" = "H1_Xi", "Xi_2" = "H2_Xi")) %>%
-    pivot_wider(id_cols = PS, names_from = combi, values_from = counts, values_fill = 0) %>%
+    pivot_wider(id_cols = PS, names_from = combi, values_from = counts, values_fill = 0)
+
+  # Ensure all 4 expected columns exist; pivot_wider omits columns for combinations
+  # that never appear in the data (values_fill only fills within existing columns)
+  for (col in c("H1_Xa", "H2_Xa", "H1_Xi", "H2_Xi")) {
+    if (!col %in% names(skew_by_block)) skew_by_block[[col]] <- 0L
+  }
+
+  skew_by_block <- skew_by_block %>%
     mutate(H1_Xa_skew = (H1_Xa + H2_Xi) / (H1_Xa + H1_Xi + H2_Xa + H2_Xi))
 
   return(skew_by_block)
 }
-#This updated version uses the foreach function to iterate over the rows in parallel, and the pb$tick() line updates the progress bar for each iteration. The results are combined using the .combine = bind_rows argument, and the required packages are specified using the .packages argument.
 
 
 # Retrieve the command-line arguments
 args <- commandArgs(trailingOnly = TRUE)
 
-# Access the argument(s)
 lib <- args[1]
 bam <- args[2]
 BED <- read_tsv(args[3], col_names = c("chr", "start", "end"))
 haplotyped_reads <- read_tsv(args[4], col_names = c("read_name", "HP", "PS"))
 ncpus <- strtoi(args[5])
 
-#create the ModBamResult object
 mbr <- ModBamResult(
     methy = ModBamFiles(
         samples = lib,
@@ -112,7 +150,6 @@ mbr <- ModBamResult(
         group = 1
     )
 )
-
 
 clustered_reads <- apply_cluster_reads_parallel(mbr, BED, min_pts = 5, num_cores = ncpus)
 write_tsv(clustered_reads, paste0(lib, "_CGIX_clustered_reads.tsv.gz"))

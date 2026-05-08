@@ -1,7 +1,7 @@
 process NANOCOMP {
 
     tag "$meta.id"
-    label "process_low"
+    label "process_medium"
 
     conda "bioconda::nanocomp=1.23.1"
     container "quay.io/biocontainers/nanocomp:1.23.1--pyhdfd78af_0"

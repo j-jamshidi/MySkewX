@@ -1,19 +1,17 @@
 include {MOSDEPTH_PLOTDIST} from "../modules/local/mosdepth/plotdist/main.nf"
-include {NANOCOMP} from "../modules/local/nanocomp/main.nf"
 include {REPORT_INDIVIDUAL} from "../modules/local/report/main.nf"
 include {REPORT_BOOK} from "../modules/local/report/main.nf"
 
 workflow reporting {
     take:
-        mosdepth_report_results // channel containing by-sample and merged mosdepth report results
-        haplotagged_samples // channel containing by-sample and merged sample haplotagged bams
-        whatshap_stats_blocks // channel containing phased vcfs block stats
-        clustered_reads // channel containining clustered reads and skew information
-        cgi_bed // single-item channel containing CGI bed file
+        mosdepth_report_results   // [meta, global_dist_txt]
+        haplotagged_samples       // [meta, bams, bais] — kept for API compatibility, not used here
+        whatshap_stats_blocks     // [meta, whatshap_stats_txt, blocks_tsv]
+        clustered_reads           // [meta, clustered_tsv, skew_tsv]
+        cgi_bed                   // [meta_id, bed_file]
 
     main:
-        // prepare mosdepth coverage report
-        // add script into channels
+        // mosdepth coverage plot
         ch_plot_dist_script = Channel.fromPath("https://raw.githubusercontent.com/brentp/mosdepth/v0.3.6/scripts/plot-dist.py")
         (ch_global_dist_bysample, ch_plot_dist_script_rep) = mosdepth_report_results
             .combine(ch_plot_dist_script)
@@ -23,39 +21,38 @@ workflow reporting {
             }
         ch_mosdepth_dist_report = MOSDEPTH_PLOTDIST(ch_plot_dist_script_rep, ch_global_dist_bysample)
 
-        // prepare nanocomp reports
-        ch_nanocomp = NANOCOMP(haplotagged_samples)
+        // Build clustered-reads channel keyed by (id, sample).
+        // clustered_reads has meta.sample as a plain string; recover the grouped sample list
+        // from ch_mosdepth_dist_report (which already has meta.sample as a sorted list).
+        ch_clustered_keyed = clustered_reads
+            .map{meta, clustered, skew -> tuple(meta.id, clustered, skew)}
+            .groupTuple()
+            .join(ch_mosdepth_dist_report.map{meta, html -> tuple(meta.id, meta.sample)})
+            .map{id, clustered_list, skew_list, sample -> tuple(id, sample, clustered_list, skew_list)}
 
-        // combine nanocomp + mosdepth reports
-        // join key is (id, sample) — sample is a sorted list after groupTuple in main.nf
-        // flat tuple after all joins:
-        // [0:id, 1:sample, 2:nanocomp_htmls, 3:mosdepth_html, 4:whatshap_stats_txt, 5:whatshap_blocks_tsv, 6:[clustered_reads_list], 7:[skew_list]]
-        ch_combined_qc_reports = ch_nanocomp
-            .map{it -> tuple(it[0].id, it[0].sample, it[1])}
-            .join(ch_mosdepth_dist_report.map{it -> tuple(it[0].id, it[0].sample, it[1])})
-            .join(whatshap_stats_blocks.map{it -> tuple(it[0].id, it[0].sample, it[1], it[2])})
+        // Join all report inputs by (id, sample) using by:[0,1] so that the duplicate
+        // sample element introduced by plain .join() is avoided.
+        // Result tuple after all joins: [id, sample, mosdepth_html, whatshap_txt, whatshap_blocks, clustered_list, skew_list]
+        ch_combined_qc_reports = ch_mosdepth_dist_report
+            .map{meta, html -> tuple(meta.id, meta.sample, html)}
             .join(
-                clustered_reads
-                    .map{it -> tuple(it[0].id, it[1], it[2])}  // key on id only; sample is a plain string here
-                    .groupTuple()                               // group all clustered/skew files per individual
-                    .map{id, clustered_list, skew_list ->
-                        // recover the grouped sample list from nanocomp channel via join on id
-                        tuple(id, clustered_list, skew_list)
-                    }
-                    .join(ch_nanocomp.map{it -> tuple(it[0].id, it[0].sample)})  // bring in the sorted sample list
-                    .map{id, clustered_list, skew_list, sample_list -> tuple(id, sample_list, clustered_list, skew_list)}
+                whatshap_stats_blocks.map{meta, txt, blocks -> tuple(meta.id, meta.sample, txt, blocks)},
+                by: [0, 1]
             )
-            .map{it -> tuple([id: it[0], sample: it[1]], it[2] + [it[3]], it[4], it[5], it[6], it[7])}
+            .join(ch_clustered_keyed, by: [0, 1])
+            .map{id, sample, mosdepth_html, whatshap_txt, whatshap_blocks, clustered_list, skew_list ->
+                tuple([id: id, sample: sample], [mosdepth_html], whatshap_txt, whatshap_blocks, clustered_list, skew_list)
+            }
             .combine(cgi_bed.map{it -> it[1]})
             .combine(channel.fromPath("${projectDir}/assets/report-templates/individual_report.qmd", checkIfExists: true))
 
         ch_reporting_files = REPORT_INDIVIDUAL(ch_combined_qc_reports)
 
-        // create channel for templates
         ch_book_template_files = channel.fromPath([
             "${projectDir}/assets/report-templates/_quarto_template.yml",
             "${projectDir}/assets/report-templates/index.qmd"
-        ], checkIfExists: true).collect() // collect to make sure all the files are one item
+        ], checkIfExists: true).collect()
+
         book = REPORT_BOOK(
             ch_book_template_files,
             ch_reporting_files.qmds.collect(),
@@ -66,6 +63,7 @@ workflow reporting {
             ch_reporting_files.skew_tsv.collect(),
             cgi_bed.map{it -> it[1]}
         )
+
     emit:
         book
 }

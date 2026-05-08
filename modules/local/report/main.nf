@@ -3,6 +3,11 @@ process REPORT_INDIVIDUAL {
     tag "$meta.id"
     label "process_single"
 
+    conda "${moduleDir}/../R/environment.yml"
+    container "${ workflow.containerEngine == 'singularity' && !task.ext.singularity_pull_docker_container ?
+        'library://qgouil/skewx/skewx-r:0.2' :
+        'ghcr.io/qgouil/skewx-r:0.2' }"
+
     input:
     tuple val(meta),
           path(htmls),
